@@ -96,7 +96,7 @@ export default function piWorkflows(pi: ExtensionAPI) {
       if (subcmd === "review" || subcmd === "preview") {
         const draft = authoringState?.pendingDraft;
         if (draft) {
-          await openPreviewTui(draft, pi, ctx, runStore, adapter, coordinator, registry);
+          await openPreviewTui(draft, pi, ctx, runStore, adapter, coordinator, registry, handlerMap);
         } else {
           ctx.ui.notify("pi-workflows: no pending draft; run /workflows create first", "info");
         }
@@ -141,7 +141,7 @@ export default function piWorkflows(pi: ExtensionAPI) {
     if (directiveQueue.completeTurn()) directiveQueue.processNext((t) => pi.sendUserMessage(t));
     if (authoringState?.pendingDraft && ctx?.ui) {
       const draft = authoringState.pendingDraft;
-      void openPreviewTui(draft, pi, ctx, runStore, adapter, coordinator, registry);
+      void openPreviewTui(draft, pi, ctx, runStore, adapter, coordinator, registry, handlerMap);
     }
   });
 
@@ -225,7 +225,8 @@ async function openPreviewTui(
   runStore: RunStore,
   adapter: RpcAdapter | null,
   coordinator: RunCoordinator | null,
-  registry: WorkflowRegistry
+  registry: WorkflowRegistry,
+  handlerMap: Map<string, (args: string) => Promise<void>>
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     ctx.ui.notify(`pi-workflows: draft "${draft.name}" ready — run /workflows review in TUI mode`, "info");
@@ -233,9 +234,9 @@ async function openPreviewTui(
   }
   try {
     const result: PreviewResult = await ctx.ui.custom<PreviewResult>((_tui, _theme, _keys, done) =>
-      new PreviewTui(draft.ir, (r: PreviewResult) => done(r))
+      new PreviewTui(draft.ir, (r: PreviewResult) => done(r), { rpcAvailable: adapter?.state === "available" })
     );
-    await handlePreviewResult(result, draft, pi, ctx, runStore, adapter, coordinator, registry);
+    await handlePreviewResult(result, draft, pi, ctx, runStore, adapter, coordinator, registry, handlerMap);
     consumeAuthoringDraft();
   } catch {
     ctx.ui.notify("pi-workflows: could not open preview TUI; draft kept — run /workflows review", "warning");
@@ -250,7 +251,8 @@ async function handlePreviewResult(
   runStore: RunStore,
   adapter: RpcAdapter | null,
   coordinator: RunCoordinator | null,
-  registry: WorkflowRegistry
+  registry: WorkflowRegistry,
+  handlerMap: Map<string, (args: string) => Promise<void>>
 ): Promise<void> {
   if (result.action === "cancel") {
     ctx.ui.notify("pi-workflows: draft discarded", "info");
@@ -266,11 +268,44 @@ async function handlePreviewResult(
   const collision = registry.checkCollision(def.name, { scope: def.scope, path: def.path });
   if (collision.collision) { ctx.ui.notify(`pi-workflows: name "${def.name}" collides with ${collision.kind}; not saved`, "warning"); return; }
   if (!persistWorkflow(def, ctx)) return;
+  registerWorkflowLive(def.name, def, ctx, pi, registry, handlerMap, runStore, adapter, coordinator);
   if (result.action === "run") {
     await runWorkflow(def, pi, runStore, adapter, coordinator, {});
   } else {
-    ctx.ui.notify(`pi-workflows: "${def.name}" saved (${def.scope}) — run /reload to register`, "info");
+    ctx.ui.notify(`pi-workflows: "${def.name}" saved and registered (${def.scope})`, "info");
   }
+}
+
+/**
+ * Make a saved workflow live in this session: update the in-memory registry
+ * and handler map, and register a Pi slash command ONLY when none exists
+ * (Pi 0.84.1 has no unregisterCommand — a stale command handler dynamically
+ * resolves the registry and truthfully rejects a deleted workflow).
+ */
+function registerWorkflowLive(
+  name: string,
+  def: WorkflowDef,
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  registry: WorkflowRegistry,
+  handlerMap: Map<string, (args: string) => Promise<void>>,
+  runStore: RunStore,
+  adapter: RpcAdapter | null,
+  coordinator: RunCoordinator | null
+): void {
+  registry.register(def.name, def);
+  if (handlerMap.has(name)) {
+    // Existing Pi command + handler resolve through the registry on every
+    // call, so the re-saved def is picked up automatically.
+    return;
+  }
+  const handler = (args: string): Promise<void> =>
+    runWorkflowByName(def.name, args, ctx.cwd, pi, runStore, adapter, coordinator, registry);
+  handlerMap.set(name, handler);
+  pi.registerCommand(name, {
+    description: def.description ?? `Workflow: ${name}`,
+    handler: async (args) => handler(args),
+  });
 }
 
 /** Persist a workflow: validate, write atomically, update registry file. */
@@ -304,11 +339,15 @@ async function handleBrowseResult(
 ): Promise<void> {
   switch (result.action) {
     case "create":
-      await startWorkflowCreation("", pi, ctx, adapter, null);
+      // Exact description typed in the create screen; `/workflows create <desc>` unchanged.
+      await startWorkflowCreation(result.description, pi, ctx, adapter, null);
       break;
     case "run-workflow": {
-      const def = registry.get(result.name);
-      if (def) await runWorkflow(def, pi, runStore, adapter, coordinator, parseWorkflowArgs(result.args ?? ""));
+      const base = registry.get(result.name);
+      if (!base) break;
+      // Preview edits carry the assembled IR; run THAT, not the on-disk def.
+      const def = result.ir ? { ...base, ir: result.ir } : base;
+      await runWorkflow(def, pi, runStore, adapter, coordinator, parseWorkflowArgs(result.args ?? ""));
       break;
     }
     case "save-workflow": {
@@ -325,7 +364,8 @@ async function handleBrowseResult(
         return;
       }
       if (persistWorkflow(def, ctx)) {
-        ctx.ui.notify(`pi-workflows: "${def.name}" saved (${def.scope}) — run /reload to register`, "info");
+        registerWorkflowLive(def.name, def, ctx, pi, registry, handlerMap, runStore, adapter, coordinator);
+        ctx.ui.notify(`pi-workflows: "${def.name}" saved and registered (${def.scope})`, "info");
       }
       break;
     }
@@ -333,7 +373,10 @@ async function handleBrowseResult(
       const entries = loadRegistry();
       registry.unregister(result.name);
       handlerMap.delete(result.name);
-      if (softDeleteWorkflow(result.name, entries)) saveRegistry(entries);
+      if (softDeleteWorkflow(result.name, entries)) {
+        saveRegistry(entries);
+        ctx.ui.notify(`pi-workflows: "${result.name}" deleted; the stale /${result.name} handler now rejects until reload`, "info");
+      }
       break;
     }
     case "stop-run":

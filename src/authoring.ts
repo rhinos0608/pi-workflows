@@ -117,7 +117,7 @@ export function buildIRPrompt(description: string, availableAgents: string[], ir
     "- limits.maxRounds default 10 max 50; limits.maxAgents default 8 max 32",
     "- No JavaScript, no template execution. {{arg_name}} = simple string substitution only.",
     "- name must match [a-zA-Z0-9_-]+, ≤128 chars",
-    "- contains gate is not supported at runtime; use success gate only",
+    "- contains gates use literal, case-sensitive terminal output text; regex and evaluation are forbidden",
     "",
     `Request: ${description}`,
   ].join("\n");

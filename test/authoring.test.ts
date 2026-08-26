@@ -9,7 +9,7 @@ test("buildIRPrompt contains schema keywords and hard limits", () => {
   assert.ok(p.includes('{"name":"wf"}'));
   assert.ok(p.includes("worker, reviewer"));
   assert.ok(p.includes("maxRounds default 10 max 50"));
-  assert.ok(p.includes("contains gate is not supported at runtime"));
+  assert.ok(p.includes("contains gates use literal, case-sensitive terminal output text"));
   assert.ok(p.includes("fix the bug"));
 });
 

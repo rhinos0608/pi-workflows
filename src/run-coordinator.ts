@@ -5,15 +5,14 @@
  * polling). Never implements dispatch, lifecycle, retry, worktrees, or model
  * selection — all execution is adapter.spawn()/status()/interrupt()/stop().
  *
- * Output source: RPC `status` returns lifecycle state, steps, and aggregate
- * token/cost fields — never agent text. run.outputs[key] holds a bounded
- * summary derived from those fields only. `contains` gates are rejected.
+ * Output source: RPC `result` returns bounded terminal text. Raw text stays
+ * private to run history; user notifications contain output metadata only.
  * No retry: any RPC error or subagent failure transitions to `failed`.
  *
  * Workflow/model/subagent outputs are data, never executable instructions.
  */
 import { effectiveMaxAgents, type WorkflowIR, type Phase, type Step } from "./ir.ts";
-import type { RpcAdapter, StatusResult } from "./rpc-adapter.ts";
+import type { RpcAdapter, RpcResult } from "./rpc-adapter.ts";
 import { type RunStore, type WorkflowRun, applyTransition } from "./run-state.ts";
 
 export interface CoordinatorOptions {
@@ -41,7 +40,7 @@ export interface RunResultMessage {
   workflow: string;
   status: "completed" | "failed" | "stopped";
   phases: number;
-  outputs: Record<string, string>;
+  outputKeys: string[];
   totalTokens: number | null;
   totalCost: number | null;
   error: string | null;
@@ -57,13 +56,7 @@ export function renderTemplate(template: string, args: Record<string, unknown>):
   });
 }
 
-function summaryOf(status: StatusResult): string {
-  return JSON.stringify({
-    state: status.state,
-    totalTokens: status.totalTokens ?? null,
-    totalCost: status.totalCost ?? null,
-  });
-}
+function summaryOf(result: Extract<RpcResult, { ready: true }>): string { return result.output; }
 
 export class RunCoordinator {
   private readonly adapter: RpcAdapter;
@@ -72,6 +65,8 @@ export class RunCoordinator {
   private readonly cwd: string;
   private readonly pollIntervalMs: number;
   private readonly activeSubagents = new Set<string>();
+  private readonly terminalOutputs = new Map<string, string>();
+  private readonly outputTruncated = new Map<string, boolean>();
 
   constructor(options: CoordinatorOptions) {
     this.adapter = options.adapter;
@@ -208,7 +203,7 @@ export class RunCoordinator {
       workflow: this.freshById(result.runId).workflowName,
       status: result.status,
       phases: result.phaseIndex + 1,
-      outputs: result.outputs,
+      outputKeys: Object.keys(result.outputs),
       totalTokens: result.totalTokens ?? null,
       totalCost: result.totalCost ?? null,
       error: result.error ?? null,
@@ -257,8 +252,9 @@ export class RunCoordinator {
       }
       count += 1;
       const r = await this.spawnAndPoll(this.fresh(run), step, phaseIndex, phase.steps.indexOf(step));
-      if (r.state === "failed" || r.state === "stopped") {
-        this.fail(run, `subagent ${step.agent} ended ${r.state}`);
+      if (r.state !== "complete") {
+        if (r.state === "stopped") this.commit(run, applyTransition(this.freshById(run.runId), "stop"));
+        else this.fail(run, `subagent ${step.agent} ended ${r.state}`);
         return { phaseIndex, spawnCount: count };
       }
       this.recordOutput(this.fresh(run), step, r);
@@ -288,8 +284,9 @@ export class RunCoordinator {
       count += chunk.length;
       for (const [j, step] of chunk.entries()) {
         const r = results[j];
-        if (r.state === "failed" || r.state === "stopped") {
-          this.fail(run, `subagent ${step.agent} ended ${r.state}`);
+        if (r.state !== "complete") {
+          if (r.state === "stopped") this.commit(run, applyTransition(this.freshById(run.runId), "stop"));
+          else this.fail(run, `subagent ${step.agent} ended ${r.state}`);
           return { phaseIndex, spawnCount: count };
         }
         this.recordOutput(this.fresh(run), step, r);
@@ -321,18 +318,21 @@ export class RunCoordinator {
         }
         count += 1;
         const r = await this.spawnAndPoll(this.fresh(run), step, phaseIndex, phase.steps.indexOf(step));
-        if (r.state === "failed" || r.state === "stopped") {
-          this.fail(run, `subagent ${step.agent} ended ${r.state}`);
+        if (r.state !== "complete") {
+          if (r.state === "stopped") this.commit(run, applyTransition(this.freshById(run.runId), "stop"));
+          else this.fail(run, `subagent ${step.agent} ended ${r.state}`);
           return { phaseIndex, spawnCount: count };
         }
         this.recordOutput(this.fresh(run), step, r);
         const cur = this.freshById(run.runId);
         if (cur.status === "failed" || cur.status === "stopped") return { phaseIndex, spawnCount: count };
       }
-      // until.success: the loop exits once any step output has been recorded.
-      // (RPC exposes no text content, so "success" is lifecycle-only.)
       if (phase.until.type === "contains") {
-        this.fail(run, "contains gate not supported: RPC status does not expose text output; use success gate");
+        const output = this.terminalOutputs.get(`${run.runId}:${phase.until.outputKey}`);
+        const truncated = this.outputTruncated.get(`${run.runId}:${phase.until.outputKey}`) === true;
+        if (output !== undefined && output.includes(phase.until.pattern)) return { phaseIndex: this.advance(run, phaseIndex), spawnCount: count };
+        if (!truncated) { rounds++; continue; }
+        this.fail(run, "contains_indeterminate: result output was truncated or literal was absent");
         return { phaseIndex, spawnCount: count };
       }
       if (Object.keys(this.freshById(run.runId).outputs).length > 0) {
@@ -345,7 +345,11 @@ export class RunCoordinator {
   private evalGate(run: WorkflowRun, phase: Extract<Phase, { type: "gate" }>, phaseIndex: number): number {
     const cond = phase.condition;
     if (cond.type === "contains") {
-      this.fail(run, "contains gate not supported: RPC status does not expose text output; use success gate");
+      const output = this.terminalOutputs.get(`${run.runId}:${cond.outputKey}`);
+      const truncated = this.outputTruncated.get(`${run.runId}:${cond.outputKey}`) === true;
+      if (output !== undefined && output.includes(cond.pattern)) return phaseIndex + 1;
+      if (!truncated) return phase.skipToPhase;
+      this.fail(run, "contains_indeterminate: result output was truncated or literal was absent");
       return phaseIndex;
     }
     const passes = Object.prototype.hasOwnProperty.call(this.freshById(run.runId).outputs, cond.outputKey);
@@ -355,22 +359,19 @@ export class RunCoordinator {
     return phase.skipToPhase;
   }
 
-  private recordOutput(run: WorkflowRun, step: Step, r: StatusResult): void {
+  private recordOutput(run: WorkflowRun, step: Step, r: Extract<RpcResult, { ready: true }>): void {
     const next = this.fresh(run);
     if (step.outputKey !== undefined) {
       next.outputs[step.outputKey] = summaryOf(r);
-    }
-    if (typeof r.totalTokens === "number") {
-      next.tokenTotal = (next.tokenTotal ?? 0) + r.totalTokens;
-    }
-    if (typeof r.totalCost === "number") {
-      next.totalCost = (next.totalCost ?? 0) + r.totalCost;
+      const outputKey = `${run.runId}:${step.outputKey}`;
+      this.terminalOutputs.set(outputKey, r.output);
+      this.outputTruncated.set(outputKey, r.outputTruncated);
     }
     this.commit(run, next);
   }
 
   /** Spawn one step (async:true always) and poll until terminal. No retry. */
-  private async spawnAndPoll(run: WorkflowRun, step: Step, phaseIndex: number, stepIndex: number): Promise<StatusResult> {
+  private async spawnAndPoll(run: WorkflowRun, step: Step, phaseIndex: number, stepIndex: number): Promise<Extract<RpcResult, { ready: true }>> {
     const task = renderTemplate(step.task, run.args);
     const spawn = await this.adapter.spawn({
       agent: step.agent,
@@ -386,13 +387,10 @@ export class RunCoordinator {
     this.commit(run, withRunId);
     for (;;) {
       await sleep(this.pollIntervalMs);
-      const status = await this.adapter.status({ runId: spawn.runId });
-      if (status.state === "complete" || status.state === "failed" || status.state === "stopped") {
-        this.activeSubagents.delete(spawn.runId);
-        return status;
-      }
-      // queued/running/paused: keep polling. Stop/pause is RPC-driven from
-      // the TUI (coordinator.stop/pause), not poll-driven.
+      const result = await this.adapter.result({ runId: spawn.runId });
+      if (!result.ready) continue;
+      this.activeSubagents.delete(spawn.runId);
+      return result;
     }
   }
 

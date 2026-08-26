@@ -76,3 +76,87 @@ test("name chars beyond [a-zA-Z0-9_-] break directive start", () => {
   const dir = r.tokens.find((t) => t.type === "directive");
   assert.equal(dir && dir.type === "directive" && dir.args, "!x");
 });
+
+const reviewKnown = new Set(["review", "verify"]);
+
+function dir(tokens: ReturnType<typeof parseDirectives>["tokens"], name: string) {
+  return tokens.find(
+    (t): t is Extract<ReturnType<typeof parseDirectives>["tokens"][number], { type: "directive" }> =>
+      t.type === "directive" && t.name === name
+  );
+}
+
+test("exact connector regression: prose kept, connector clauses never become args", () => {
+  const r = parseDirectives(
+    "Do X, then /review, then loop until reviewers satisfied and then /verify",
+    reviewKnown
+  );
+  assert.equal(r.directiveCount, 2);
+  assert.deepEqual(r.tokens[0], { type: "prose", text: "Do X, then " });
+  const review = dir(r.tokens, "review");
+  const verify = dir(r.tokens, "verify");
+  assert.equal(review && review.args, "");
+  assert.equal(verify && verify.args, "");
+});
+
+test("explicit inline args via colon", () => {
+  const r = parseDirectives("/review: inspect cache", reviewKnown);
+  const review = dir(r.tokens, "review");
+  assert.equal(review && review.args, "inspect cache");
+  assert.equal(r.directiveCount, 1);
+});
+
+test("explicit inline args via 'to'", () => {
+  const r = parseDirectives("/review to inspect cache", reviewKnown);
+  const review = dir(r.tokens, "review");
+  assert.equal(review && review.args, "inspect cache");
+});
+
+test("each connector never becomes preceding args", () => {
+  for (const conn of ["then", "and then", "afterwards", "followed by"]) {
+    const r = parseDirectives(`/wf-a first, ${conn} /skill1`, known);
+    const wf = dir(r.tokens, "wf-a");
+    assert.equal(wf && wf.args, "first", `connector "${conn}"`);
+  }
+});
+
+test("connector-only tail yields empty args", () => {
+  for (const conn of ["then", "and then", "afterwards", "followed by"]) {
+    const r = parseDirectives(`Do X, ${conn} /review, ${conn} /verify`, reviewKnown);
+    const review = dir(r.tokens, "review");
+    const verify = dir(r.tokens, "verify");
+    assert.equal(review && review.args, "", `connector "${conn}"`);
+    assert.equal(verify && verify.args, "", `connector "${conn}"`);
+  }
+});
+
+test("explicit args ending in connector omit the trailing connector", () => {
+  const r = parseDirectives(
+    "/wf-a inspect cache, then /skill1 afterwards /other",
+    known
+  );
+  const wf = dir(r.tokens, "wf-a");
+  assert.equal(wf && wf.args, "inspect cache");
+  const skill = dir(r.tokens, "skill1");
+  assert.equal(skill && skill.args, "");
+});
+
+test("connector before cap-exceeded directive is not a dispatch separator", () => {
+  const input =
+    Array.from({ length: 8 }, (_, i) => `/wf-a n=${i}`).join(" ") +
+    ", then /skill1 x";
+  const r = parseDirectives(input, known);
+  assert.equal(r.directiveCount, 8);
+  const dirs = r.tokens.filter((t) => t.type === "directive");
+  assert.equal(dirs.length, 8);
+  assert.equal(dirs[7].args, "n=7"); // connector stripped, ordinary args kept
+  const prose = r.tokens.filter((t) => t.type === "prose");
+  assert.equal(prose.length, 1);
+  assert.equal(prose[0].text, "/skill1 x"); // 9th stays prose: cap semantics kept
+});
+
+test("ordinary positional args preserved when not connector-delimited", () => {
+  const r = parseDirectives("/wf-a one two three", known);
+  const wf = dir(r.tokens, "wf-a");
+  assert.equal(wf && wf.args, "one two three");
+});

@@ -18,21 +18,69 @@ export type InputToken =
   | { type: "directive"; name: string; args: string; raw: string };
 
 /**
- * Grammar (deterministic, single left-to-right pass):
+ * Grammar (deterministic, single left-to-right pass, no LLM):
  *
  *   input      ::= token* EOF
  *   token      ::= directive | prose_run
- *   directive  ::= "/" name (" " args_tail)?
+ *   directive  ::= "/" name args_tail?
  *                 where name ∈ knownNames
  *                 and directive-count < MAX_DIRECTIVES
- *   args_tail  ::= everything up to (but not including) the next
- *                  "/" name-in-known | EOF
  *   name       ::= [a-zA-Z0-9_-]+
  *   prose_run  ::= any chars not starting a recognized directive
  *
- * After MAX_DIRECTIVES directives, every remaining "/name" (even a known
- * one) is prose. An unknown "/foo" is prose preserved verbatim.
+ *   args_tail  ::= everything up to (but not including) the next
+ *                  "/" name-in-known | EOF, minus connector clauses
+ *   connector  ::= ( "," | ";" )? ( "and then" | "then" | "afterwards" |
+ *                  "followed by" ) (case-insensitive, word-bounded),
+ *                  plus any connective clause between two connectors in
+ *                  the same span (e.g. ", then loop until … and then")
+ *
+ * Deterministic arg rules:
+ *   1. Explicit inline forms: "/name: …" (colon) and "/name to …" start
+ *      the args directly (colon adheres with no space).
+ *   2. A tail that starts with a connector clause yields "" — the clause
+ *      is connective prose between dispatches, never args. So in
+ *        Do X, then /review, then loop until reviewers satisfied and
+ *        then /verify
+ *      "review" and "verify" both get args "" and the leading prose is
+ *      "Do X, then ".
+ *   3. Otherwise args = the tail up to the first connector; a trailing
+ *      connector (and anything after it) is connective prose and is
+ *      omitted — "/wf-a inspect cache, then /other" keeps "inspect cache".
+ *   4. Ordinary positional args are preserved verbatim when no connector
+ *      delimits them.
+ *   5. The directive ceiling is enforced by the same isDirectiveStart
+ *      predicate used for dispatch, so a connector before the 9th "/name"
+ *      never promotes it into a dispatch: it stays prose (cap semantics
+ *      unchanged; connector text still never lands in the 8th args).
+ *   6. An unknown "/foo" is prose preserved verbatim.
  */
+/** Connector words; alternatives ordered so "and then" wins over "then". */
+const CONNECTOR = /(?:and\s+then|then|afterwards|followed\s+by)\b/i;
+const CONNECTOR_AT_START = /^(?:and\s+then|then|afterwards|followed\s+by)\b/i;
+
+/** Colon and "to" inline-arg introducers. */
+const COLON_ARG = /^:\s*/;
+const TO_ARG = /^to\b/i;
+
+/**
+ * Strip connector clauses from a directive args tail (see grammar rules).
+ * Pure. Only strips the finite connector set — ordinary positional args
+ * pass through untouched when no connector delimits them.
+ */
+function stripConnectors(argsRaw: string): string {
+  // Explicit inline forms first: "/name: …" and "/name to …".
+  let t = argsRaw.trim().replace(COLON_ARG, "").replace(TO_ARG, "").trim();
+  // Commas/semicolons may surround a connector.
+  t = t.replace(/^[,;]\s*/, "");
+  if (t === "") return "";
+  if (CONNECTOR_AT_START.test(t)) return ""; // whole tail is a connector clause
+  const at = t.search(CONNECTOR);
+  if (at === -1) return t;
+  // Trim the trailing connector along with any comma/semicolon/space.
+  return t.slice(0, at).replace(/[\s,;]+$/, "");
+}
+
 export function parseDirectives(text: string, knownNames: ReadonlySet<string>): ParsedInput {
   const tokens: InputToken[] = [];
   let directiveCount = 0;
@@ -66,7 +114,7 @@ export function parseDirectives(text: string, knownNames: ReadonlySet<string>): 
           j++;
         }
         const argsRaw = text.slice(start.at, j);
-        const args = argsRaw.trim();
+        const args = stripConnectors(argsRaw);
         const raw = text.slice(i, j).trimEnd();
         tokens.push({ type: "directive", name: start.name, args, raw });
         directiveCount++;

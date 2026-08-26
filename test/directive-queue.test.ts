@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DirectiveQueue } from "../src/directive-queue.ts";
+import { parseDirectives } from "../src/parser.ts";
 import type { InputToken } from "../src/parser.ts";
 
 type Item = Parameters<DirectiveQueue["enqueue"]>[0][0];
@@ -118,6 +119,31 @@ test("empty prose tokens skipped", () => {
   assert.deepEqual(sent, []);
   assert.equal(q.pending, false);
 });
+test("parser connector tokens flow through queue with clean args", () => {
+  const q = new DirectiveQueue();
+  const map = new Map<string, (args: string) => Promise<void>>();
+  let wfArgs: string | null = null;
+  map.set("wf-a", async (args: string) => { wfArgs = args; });
+  q.setHandlerMap(map);
+  const sent: string[] = [];
+  const parsed = parseDirectives(
+    "Do X, then /wf-a, then loop until reviewers satisfied and then /skill1 go",
+    new Set(["wf-a", "skill1"])
+  );
+  q.enqueue(parsed.tokens, new Set(["wf-a"]), new Set(["skill1"]));
+  q.processNext((t) => sent.push(t)); // prose first
+  assert.deepEqual(sent, ["Do X, then"]);
+  assert.equal(wfArgs, null);
+  q.completeTurn();
+  q.processNext((t) => sent.push(t)); // wf-a: connector clause never reaches args
+  q.completeTurn();
+  assert.equal(wfArgs, "");
+  q.processNext((t) => sent.push(t)); // skill1 reinjected with its own args
+  q.completeTurn();
+  assert.deepEqual(sent, ["Do X, then", "/skill1 go"]);
+  assert.equal(q.pending, false);
+});
+
 test("queued workflows wait for result lifecycle completion", async () => {
   const q = new DirectiveQueue();
   const calls: string[] = [];

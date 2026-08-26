@@ -5,11 +5,7 @@
  * { agent, task } descriptors consumed by the run coordinator, which composes
  * exclusively via pi-subagents RPC v1.
  *
- * Note: `contains` gates are allowed by the schema for forward compatibility,
- * but the run coordinator rejects them at runtime — RPC v1 `status` does not
- * expose agent text output, so there is no stable content source to evaluate
- * them against. Preserving the type keeps IR v1 stable for a future RPC
- * version that adds a stable output contract.
+ * `contains` gates use bounded terminal text returned by RPC v1 result.
  */
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";

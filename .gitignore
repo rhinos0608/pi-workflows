@@ -3,6 +3,7 @@
 .pi-smartread.tags.cache/
 .pi-subagents/
 .subagents/
+.smart-edit-undo/
 
 # Node install/build artifacts
 node_modules/

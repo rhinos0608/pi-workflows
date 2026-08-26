@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { RunCoordinator, renderTemplate } from "../src/run-coordinator.ts";
 import { RunStore, createRun } from "../src/run-state.ts";
-import type { RpcAdapter, StatusResult, SpawnResult } from "../src/rpc-adapter.ts";
+import type { RpcAdapter, RpcResult, SpawnResult } from "../src/rpc-adapter.ts";
 import { makeIr } from "./support.ts";
 
 const TERMINAL = new Set(["complete", "failed", "stopped"]);
@@ -10,10 +10,13 @@ const TERMINAL = new Set(["complete", "failed", "stopped"]);
 /** Deterministic mock adapter: status state sequence per runId. */
 class MockAdapter {
   state: RpcAdapter["state"] = "available";
-  capabilities = { status: true, asyncSpawn: true, interrupt: true, stop: true } as const;
+  capabilities = { status: true, spawn: true, result: true, asyncSpawn: true, interrupt: true, stop: true } as const;
+  output = "done";
   spawned: Array<{ agent: string; task: string; context: string; cwd: string }> = [];
-  private sequence: Array<"queued" | "running" | "complete" | "failed" | "stopped"> = [];
-  private queueFor = new Map<string, string[]>();
+  private sequence: Array<"queued" | "running" | "complete" | "failed" | "paused" | "stopped" | "rejected"> = [];
+  private queueFor = new Map<string, MockAdapter["sequence"]>();
+  resultCalls = 0;
+  outputTruncated = false;
   interruptCalled = 0;
   stopCalled = 0;
   stopIds: string[] = [];
@@ -22,11 +25,10 @@ class MockAdapter {
     this.sequence = sequence;
   }
 
-  private next(runId: string): string {
+  private next(runId: string): MockAdapter["sequence"][number] {
     const q = this.queueFor.get(runId) ?? [];
     if (q.length === 0) {
-      const s = this.sequence[Math.min(this.sequence.length - 1, 0)] ?? "complete";
-      q.push(s);
+      q.push(...(this.sequence.length > 0 ? this.sequence : ["complete"] as const));
       this.queueFor.set(runId, q);
     }
     return q.shift() ?? "complete";
@@ -38,15 +40,18 @@ class MockAdapter {
     return { runId, asyncDir: `/tmp/x/${runId}` };
   }
 
-  async status(_params: { runId?: string; id?: string; dir?: string }): Promise<StatusResult> {
-    const runId = _params.runId ?? "r1";
-    const state = this.next(runId);
+  async result(_params: { runId: string }): Promise<RpcResult> {
+    this.resultCalls += 1;
+    const state = this.next(_params.runId);
+    if (state === "queued" || state === "running") return { runId: _params.runId, ready: false, state };
     return {
-      state: state as StatusResult["state"],
-      runId,
-      sessionId: "s",
-      totalTokens: 10,
-      totalCost: 0.01,
+      runId: _params.runId,
+      ready: true,
+      state,
+      outcome: state === "complete" ? "success" : state === "stopped" ? "stopped" : state === "paused" ? "paused" : "failure",
+      output: this.output,
+      outputAvailable: true,
+      outputTruncated: this.outputTruncated,
     };
   }
 
@@ -82,6 +87,16 @@ function prep(store: RunStore, name = "wf", irOverride?: unknown) {
   return run;
 }
 
+test("result polling waits through pending state before terminal result", async () => {
+  const { adapter, store, coordinator } = setup(["running", "complete"]);
+  const run = prep(store);
+
+  const res = await coordinator.run(run);
+
+  assert.equal(res.status, "completed");
+  assert.equal(adapter.resultCalls, 2);
+});
+
 test("sequential phase completes; result message emitted", async () => {
   const { adapter, store, messages, coordinator } = setup(["complete"]);
   const run = prep(store);
@@ -95,6 +110,19 @@ test("sequential phase completes; result message emitted", async () => {
   assert.equal(msg.type, "pi-workflows:run-result");
   assert.equal(msg.status, "completed");
   assert.equal(messages.length, 1);
+});
+
+test("failed, paused, rejected, and stopped terminals do not advance workflow", async (t) => {
+  for (const state of ["failed", "paused", "rejected", "stopped"] as const) {
+    await t.test(state, async () => {
+      const { adapter, store, coordinator } = setup([state]);
+      const run = prep(store);
+      const res = await coordinator.run(run);
+      assert.equal(res.status, state === "stopped" ? "stopped" : "failed");
+      assert.equal(res.phaseIndex, 0);
+      assert.equal(adapter.spawned.length, 1);
+    });
+  }
 });
 
 test("subagent failure fails the run and emits error result", async () => {
@@ -151,7 +179,7 @@ test("gate fail jumps to skipToPhase", async () => {
   assert.equal(adapter.spawned.length, 2); // phase 0 ran; gate jump → phase 2 ran
 });
 
-test("contains gate rejected at runtime", async () => {
+test("contains gate uses terminal output", async () => {
   const ir = makeIr({
     phases: [
       { type: "sequential", steps: [{ agent: "a", task: "one", outputKey: "out1" }] },
@@ -161,9 +189,78 @@ test("contains gate rejected at runtime", async () => {
   const { store, coordinator, messages } = setup(["complete"]);
   const run = prep(store, "wf", ir);
   const res = await coordinator.run(run);
+  assert.equal(res.status, "completed");
+  assert.equal(JSON.parse(messages[0]).status, "completed");
+});
+
+test("contains gate is literal and case-sensitive", async () => {
+  const ir = makeIr({
+    phases: [
+      { type: "sequential", steps: [{ agent: "a", task: "one", outputKey: "out1" }] },
+      { type: "gate", condition: { type: "contains", outputKey: "out1", pattern: "DONE" }, skipToPhase: 2 },
+      { type: "sequential", steps: [{ agent: "b", task: "fallback" }] },
+    ],
+  });
+  const { adapter, store, coordinator } = setup(["complete"]);
+  adapter.output = "done";
+  const run = prep(store, "wf", ir);
+
+  const res = await coordinator.run(run);
+
+  assert.equal(res.status, "completed");
+  assert.equal(store.get(run.runId)?.phaseIndex, 2);
+  assert.equal(adapter.spawned.length, 2);
+});
+
+test("truncated absent literal fails contains gate as indeterminate", async () => {
+  const ir = makeIr({
+    phases: [
+      { type: "sequential", steps: [{ agent: "a", task: "one", outputKey: "out1" }] },
+      { type: "gate", condition: { type: "contains", outputKey: "out1", pattern: "missing" }, skipToPhase: 0 },
+    ],
+  });
+  const { adapter, store, coordinator } = setup(["complete"]);
+  adapter.output = "tail";
+  adapter.outputTruncated = true;
+  const run = prep(store, "wf", ir);
+
+  const res = await coordinator.run(run);
+
   assert.equal(res.status, "failed");
-  assert.ok(res.error?.includes("contains gate not supported"));
-  assert.ok(JSON.parse(messages[0]).error.includes("contains gate not supported"));
+  assert.match(res.error ?? "", /contains_indeterminate/);
+});
+
+test("completion message includes output keys but not raw output", async () => {
+  const ir = makeIr({ phases: [{ type: "sequential", steps: [{ agent: "a", task: "one", outputKey: "out1" }] }] });
+  const { adapter, store, coordinator, messages } = setup(["complete"]);
+  adapter.output = "unique-canary-output";
+  const run = prep(store, "wf", ir);
+
+  await coordinator.run(run);
+
+  const message = messages[0];
+  assert.ok(message);
+  assert.deepEqual(JSON.parse(message).outputKeys, ["out1"]);
+  assert.equal(message.includes("unique-canary-output"), false);
+});
+
+test("contains gate checks untruncated RPC output before persisted tail", async () => {
+  const ir = makeIr({
+    phases: [
+      { type: "sequential", steps: [{ agent: "a", task: "one", outputKey: "out1" }] },
+      { type: "gate", condition: { type: "contains", outputKey: "out1", pattern: "prefix-literal" }, skipToPhase: 0 },
+    ],
+  });
+  const { adapter, store, coordinator } = setup(["complete"]);
+  const output = "prefix-literal" + "x".repeat(9000);
+  adapter.output = output;
+  const run = prep(store, "wf", ir);
+
+  const res = await coordinator.run(run);
+
+  assert.equal(res.status, "completed");
+  assert.equal(store.get(run.runId)?.outputs.out1, output.slice(-8000));
+  assert.equal(store.get(run.runId)?.outputs.out1.includes("prefix-literal"), false);
 });
 
 test("loop until success exits after one round when output recorded", async () => {

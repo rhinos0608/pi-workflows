@@ -22,13 +22,13 @@ test("detection lifecycle: ready → ping → available", async () => {
   assert.equal(adapter.state, "undetected");
 
   // ready event arrives; adapter pings; our test peer answers the reply.
-  const readyData = { version: 1 as const, methods: ["ping"], capabilities: { status: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/x", sessionId: "s1", sessionFile: "/x/s.json" } };
+  const readyData = { version: 1 as const, methods: ["ping", "spawn", "result"], capabilities: { status: true, spawn: true, result: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/x", sessionId: "s1", sessionFile: "/x/s.json" } };
   bus.on(RPC_REQUEST_EVENT, (raw) => {
     const req = raw as { requestId: string; method: string };
     if (req.method === "ping") {
       // reply asynchronously to exercise the promise path
       setTimeout(() => {
-        trigger(RPC_REPLY_EVENT, { version: 1, requestId: req.requestId, ok: true, result: readyData });
+        trigger(RPC_REPLY_EVENT, { version: 1, requestId: req.requestId, success: true, data: readyData });
       }, 5);
     }
   });
@@ -43,14 +43,14 @@ test("spawn emits correct request envelope with async:true", async () => {
   const { bus, trigger, emitted } = createMockEventBus();
   const adapter = new RpcAdapter(bus);
   adapter.detect();
-  const pingData = { version: 1 as const, methods: ["ping", "spawn"], capabilities: { status: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/x", sessionId: "s", sessionFile: "/s.json" } };
+  const pingData = { version: 1 as const, methods: ["ping", "spawn", "result"], capabilities: { status: true, spawn: true, result: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/x", sessionId: "s", sessionFile: "/s.json" } };
   bus.on(RPC_REQUEST_EVENT, (raw) => {
     const req = raw as { method: string; requestId: string };
     trigger(RPC_REPLY_EVENT, {
       version: 1,
       requestId: req.requestId,
-      ok: true,
-      result: req.method === "ping" ? pingData : { runId: "run-1", asyncDir: "/tmp/pi-subagents/run-1" },
+      success: true,
+      data: req.method === "ping" ? pingData : { text: "spawned", details: { asyncId: "run-1", asyncDir: "/tmp/pi-subagents/run-1" } },
     });
   });
   trigger(RPC_READY_EVENT, pingData);
@@ -90,11 +90,11 @@ test("reply timeout rejects a hung method call", { timeout: 15_000 }, async () =
   const { bus, trigger } = createMockEventBus();
   const adapter = new RpcAdapter(bus);
   adapter.detect();
-  const pingData = { version: 1 as const, methods: ["ping"], capabilities: { status: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/", sessionId: "s", sessionFile: "/s.json" } };
+  const pingData = { version: 1 as const, methods: ["ping", "spawn", "result"], capabilities: { status: true, spawn: true, result: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/", sessionId: "s", sessionFile: "/s.json" } };
   bus.on(RPC_REQUEST_EVENT, (raw) => {
     const req = raw as { method: string; requestId: string };
     if (req.method === "ping") {
-      trigger(RPC_REPLY_EVENT, { version: 1, requestId: req.requestId, ok: true, result: pingData });
+      trigger(RPC_REPLY_EVENT, { version: 1, requestId: req.requestId, success: true, data: pingData });
       return;
     }
     // status never answered
@@ -108,20 +108,68 @@ test("stop rejects invalid state from RPC with rpc_error", async () => {
   const { bus, trigger } = createMockEventBus();
   const adapter = new RpcAdapter(bus);
   adapter.detect();
-  const pingData = { version: 1 as const, methods: ["ping", "stop"], capabilities: { status: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/", sessionId: "s", sessionFile: "/s.json" } };
+  const pingData = { version: 1 as const, methods: ["ping", "spawn", "result", "stop"], capabilities: { status: true, spawn: true, result: true, asyncSpawn: true, interrupt: true, stop: true }, session: { cwd: "/", sessionId: "s", sessionFile: "/s.json" } };
   bus.on(RPC_REQUEST_EVENT, (raw) => {
     const req = raw as { method: string; requestId: string };
     trigger(RPC_REPLY_EVENT, {
       version: 1,
       requestId: req.requestId,
-      ok: req.method === "ping",
-      result: req.method === "ping" ? pingData : undefined,
-      error: req.method === "ping" ? undefined : "invalid_state: run is not running",
+      success: req.method === "ping",
+      data: req.method === "ping" ? pingData : undefined,
+      error: req.method === "ping" ? undefined : { code: "invalid_state", message: "run is not running" },
     });
   });
   trigger(RPC_READY_EVENT, pingData);
   await wait(10);
   await assert.rejects(async () => adapter.stop({ runId: "x" }), /invalid_state/);
+});
+
+test("result rejects malformed and mismatched terminal responses", async (t) => {
+  const pingData = {
+    version: 1 as const,
+    methods: ["ping", "spawn", "result"],
+    capabilities: { status: true, spawn: true, result: true, asyncSpawn: true, interrupt: true, stop: true },
+    session: { cwd: "/", sessionId: "s", sessionFile: "/s.json" },
+  };
+  for (const [name, result] of [
+    ["malformed", { runId: "r1", ready: true, state: "complete" }],
+    ["mismatched", { runId: "other", ready: true, state: "complete", outcome: "success", output: "done", outputAvailable: true, outputTruncated: false }],
+  ] as const) {
+    await t.test(name, async () => {
+      const { bus, trigger } = createMockEventBus();
+      const adapter = new RpcAdapter(bus);
+      adapter.detect();
+      bus.on(RPC_REQUEST_EVENT, (raw) => {
+        const req = raw as { method: string; requestId: string };
+        trigger(RPC_REPLY_EVENT, { version: 1, requestId: req.requestId, success: true, data: req.method === "ping" ? pingData : result });
+      });
+      trigger(RPC_READY_EVENT, pingData);
+      await wait(5);
+      await assert.rejects(() => adapter.result({ runId: "r1" }), name === "malformed" ? /malformed/ : /mismatch/);
+    });
+  }
+});
+
+test("adapter unavailable when required spawn/result capabilities are absent", async (t) => {
+  for (const [name, methods, capabilities] of [
+    ["spawn method", ["ping", "result"], { status: true, spawn: true, result: true, asyncSpawn: true, interrupt: true, stop: true }],
+    ["result capability", ["ping", "spawn", "result"], { status: true, spawn: true, result: false, asyncSpawn: true, interrupt: true, stop: true }],
+    ["async spawn capability", ["ping", "spawn", "result"], { status: true, spawn: true, result: true, asyncSpawn: false, interrupt: true, stop: true }],
+  ] as const) {
+    await t.test(name, async () => {
+      const { bus, trigger } = createMockEventBus();
+      const adapter = new RpcAdapter(bus);
+      adapter.detect();
+      const data = { version: 1 as const, methods, capabilities, session: { cwd: "/", sessionId: "s", sessionFile: "/s.json" } };
+      bus.on(RPC_REQUEST_EVENT, (raw) => {
+        const req = raw as { requestId: string };
+        trigger(RPC_REPLY_EVENT, { version: 1, requestId: req.requestId, success: true, data });
+      });
+      trigger(RPC_READY_EVENT, data);
+      await wait(5);
+      assert.equal(adapter.state, "unavailable");
+    });
+  }
 });
 
 test("makeRequest envelope shape", () => {
