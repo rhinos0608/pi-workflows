@@ -104,7 +104,6 @@ export const COPY = {
     stopUnavailable: "stop unavailable (no stop capability from pi-subagents)",
     deleteDone: (name: string) => `"${name}" deleted`,
     previewCancelled: "preview cancelled",
-    pauseNote: "Pause/resume unavailable: pi-subagents RPC v1 has no resume method.",
     footerAvailable: `[1/2/3] tabs  [${KEY.moveUp}/${KEY.moveDown}] move  [${KEY.open}] open  [${KEY.run}] run  [${KEY.stop}] stop  [${KEY.restart}] restart  [${KEY.delete}] delete  [${KEY.create}] create  [${KEY.quit}] quit`,
     footerRpcOff: `[1/2/3] tabs  [${KEY.moveUp}/${KEY.moveDown}] move  [${KEY.open}] open  [${KEY.run}] run (disabled: pi-subagents unavailable)  [${KEY.restart}] restart  [${KEY.delete}] delete  [${KEY.create}] create  [${KEY.quit}] quit`,
   },
@@ -154,10 +153,10 @@ export const COPY = {
     until: (label: string) => `  until: ${label}`,
     step: (i: number, agent: string, task: string) => `  ${i + 1}. ${agent} \u2014 ${trunc(task, 200)}`,
     dataUnavailable: "[data unavailable]",
-    statusLine: (state: string, tokens?: number, cost?: number) =>
-      `     state: ${state}${tokens !== undefined ? ` | tokens: ${tokens}` : ""}${cost !== undefined ? ` | cost: $${cost.toFixed(4)}` : ""}`,
-    stepLine: (status: string, tokens?: number) =>
-      `       step: ${status}${tokens !== undefined ? ` (${tokens} tok)` : ""}`,
+    resultLine: (state: string) => `     state: ${state}`,
+    output: (text: string) => `     output: ${text}`,
+    noOutput: "[no output]",
+    outputTruncated: "output truncated upstream",
     footer: `[${KEY.moveUp}/${KEY.moveDown}] phases  [${KEY.escape}] back`,
   },
 } as const;

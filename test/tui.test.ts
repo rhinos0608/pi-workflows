@@ -10,8 +10,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { BrowseTui, type BrowseResult } from "../src/tui/browse-tui.ts";
+import { RunDrilldown } from "../src/tui/run-drilldown.ts";
 import { PreviewTui, type PreviewResult } from "../src/tui/preview-tui.ts";
-import { RunStore } from "../src/run-state.ts";
+import { RunStore, createRun } from "../src/run-state.ts";
 import { RpcAdapter } from "../src/rpc-adapter.ts";
 import { WorkflowRegistry } from "../src/registry.ts";
 import {
@@ -311,6 +312,53 @@ test("preview: gate details read-only, stated in the UI", () => {
   const gate = box.r.ir.phases[1] as Extract<WorkflowIR["phases"][number], { type: "gate" }>;
   assert.deepEqual(gate.condition, { type: "success", outputKey: "out" }); // untouched
   assert.equal(gate.label, "sign-off");
+});
+
+test("browse: running tab uses local run status without status RPC", (t) => {
+  let statusCalls = 0;
+  const adapter = { state: "available", status: async () => { statusCalls++; throw new Error("unexpected status call"); } } as unknown as RpcAdapter;
+  const runStore = new RunStore();
+  const run = createRun("running-demo", makeValidIr(), {});
+  run.status = "running";
+  runStore.add(run);
+  const tui = new BrowseTui({ done: () => {}, runStore, adapter, registry: new WorkflowRegistry([]), cwd });
+  t.after(() => tui.dispose());
+  tui.handleInput("2");
+  assert.match(tui.render(80).join("\n"), /running-demo.*running/);
+  assert.equal(statusCalls, 0);
+});
+
+test("drilldown: result renders pending, bounded terminal preview, truncation, unavailable, and dispose clears timer", async (t) => {
+  const run = createRun("result-demo", makeValidIr(), {});
+  run.status = "running";
+  run.subagentRunIds = ["subagent-1"];
+  let calls = 0;
+  const adapter = {
+    state: "available",
+    result: async () => calls++ === 0
+      ? { runId: "subagent-1", ready: false, state: "running" }
+      : { runId: "subagent-1", ready: true, state: "complete", outcome: "success", output: "one\ntwo\nthree", outputAvailable: true, outputTruncated: true },
+  } as unknown as RpcAdapter;
+  const tui = new RunDrilldown(run, adapter, () => {});
+  t.after(() => tui.dispose());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(tui.render(100).join("\n"), /state: running/);
+  tui.handleInput("j");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const terminal = tui.render(100).join("\n");
+  assert.match(terminal, /state: complete/);
+  assert.match(terminal, /one/);
+  assert.match(terminal, /output truncated upstream/);
+  assert.ok(calls >= 2);
+  tui.dispose();
+  const disposedCalls = calls;
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(calls, disposedCalls);
+
+  const unavailable = new RunDrilldown(run, { state: "available", result: async () => { throw new Error("offline"); } } as unknown as RpcAdapter, () => {});
+  t.after(() => unavailable.dispose());
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.match(unavailable.render(100).join("\n"), /\[data unavailable\]/);
 });
 
 test("saved preview: edited IR forwarded through save-workflow result", (t) => {

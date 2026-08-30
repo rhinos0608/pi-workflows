@@ -8,7 +8,7 @@
  * preview) — conflicting modes cannot co-exist. All copy and key bindings
  * live in ./text.ts.
  */
-import type { RpcAdapter, StatusResult } from "../rpc-adapter.ts";
+import type { RpcAdapter } from "../rpc-adapter.ts";
 import type { WorkflowRun } from "../run-state.ts";
 import type { RunStore } from "../run-state.ts";
 import type { WorkflowRegistry } from "../registry.ts";
@@ -36,7 +36,6 @@ interface SavedItem {
 
 interface RunInfo {
   run: WorkflowRun;
-  live: StatusResult | "error" | null;
 }
 
 type BrowseOverlay =
@@ -203,7 +202,7 @@ export class BrowseTui {
         const info = this.tab === "running" ? this.runningCache[this.sel] : null;
         const canStop =
           Boolean(this.opts.adapter.capabilities?.stop) &&
-          Boolean(info?.live && info.live !== "error" && info.live.state === "running");
+          info?.run.status === "running";
         if (canStop && info && this.opts.coordinator) {
           void this.opts.coordinator.stop(info.run.runId).catch(() => {
             this.note = { kind: "error", text: COPY.browse.stopFailed };
@@ -296,7 +295,7 @@ export class BrowseTui {
     this.runningCache = this.opts.runStore
       .list()
       .filter((r) => r.status === "running" || r.status === "paused")
-      .map((run) => ({ run, live: null }));
+      .map((run) => ({ run }));
     this.historyCache = this.opts.runStore.loadHistory();
     const max = this.listLength() - 1;
     if (this.sel > max) this.sel = Math.max(0, max);
@@ -305,18 +304,6 @@ export class BrowseTui {
   private refreshActive(): void {
     if (this.disposed) return;
     this.refreshLists();
-    if (this.rpcAvailable) {
-      for (const info of this.runningCache) {
-        info.live = null;
-        const ids = info.run.subagentRunIds.length > 0 ? info.run.subagentRunIds : [info.run.runId];
-        for (const runId of ids) {
-          void this.opts.adapter.status({ runId }).then((st) => {
-            info.live = st;
-            this.onInvalidate?.();
-          }).catch(() => { info.live = "error"; });
-        }
-      }
-    }
     this.onInvalidate?.();
   }
 
@@ -401,7 +388,7 @@ export class BrowseTui {
           for (const [i, info] of this.runningCache.entries()) {
             const sel = i === this.sel ? "\u25b6" : " ";
             const r = info.run;
-            const state = info.live && info.live !== "error" ? info.live.state : r.status;
+            const state = r.status;
             lines.push(`${sel} ${trunc(r.workflowName, 24)} | ${r.runId.slice(0, 8)} | ${state}`);
           }
         }
@@ -424,7 +411,6 @@ export class BrowseTui {
 
     lines.push(BAR(width));
     lines.push(this.rpcAvailable ? COPY.browse.footerAvailable : COPY.browse.footerRpcOff);
-    if (this.runningCache.some((i) => i.run.status === "paused")) lines.push(COPY.browse.pauseNote);
     return lines;
   }
 }

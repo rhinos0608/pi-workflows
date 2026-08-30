@@ -3,7 +3,7 @@
  *
  * Owns "what to run next" (phase advancement, loop counters, gate evaluation,
  * polling). Never implements dispatch, lifecycle, retry, worktrees, or model
- * selection — all execution is adapter.spawn()/status()/interrupt()/stop().
+ * selection — execution delegates to adapter.spawn()/result()/stop().
  *
  * Output source: RPC `result` returns bounded terminal text. Raw text stays
  * private to run history; user notifications contain output metadata only.
@@ -104,7 +104,7 @@ export class RunCoordinator {
     this.commit(run, applyTransition(run, "stop"));
   }
 
-  /** Stop active subagents during session shutdown (RPC v1 has no resume). */
+  /** Stop active subagents during session shutdown. */
   async shutdown(): Promise<void> {
     for (const subagentRunId of [...this.activeSubagents]) {
       try { await this.adapter.stop({ runId: subagentRunId }); } catch { /* best effort */ }

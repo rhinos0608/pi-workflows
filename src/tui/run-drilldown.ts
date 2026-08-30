@@ -1,9 +1,9 @@
 /**
  * RunDrilldown: readonly phase → agent detail for a WorkflowRun.
- * Data from RunStore + RPC status only; never reads pi-subagents artifacts.
+ * Data from RunStore + RPC result only; never reads pi-subagents artifacts.
  * RPC-gap states render truthfully as "[data unavailable]".
  */
-import type { RpcAdapter, StatusResult } from "../rpc-adapter.ts";
+import type { RpcAdapter, RpcResult } from "../rpc-adapter.ts";
 import type { WorkflowRun } from "../run-state.ts";
 import { BAR, COPY, KEY } from "./text.ts";
 
@@ -12,7 +12,7 @@ export class RunDrilldown {
   private readonly adapter: RpcAdapter;
   private readonly onBack: () => void;
   private readonly onInvalidate: () => void;
-  private statuses = new Map<string, StatusResult | "error" | "unavailable">();
+  private results = new Map<string, RpcResult | "error" | "unavailable">();
   private selectedPhase = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   private disposed = false;
@@ -33,16 +33,16 @@ export class RunDrilldown {
       : this.run.subagentRunIds.map((runId, stepIndex) => ({ runId, phaseIndex: this.selectedPhase, stepIndex }));
     if (records.length === 0) return;
     if (this.adapter.state !== "available") {
-      for (const record of records) this.statuses.set(record.runId, "unavailable");
+      for (const record of records) this.results.set(record.runId, "unavailable");
       this.onInvalidate();
       return;
     }
     await Promise.all(records.map(async ({ runId }) => {
       try {
-        const st = await this.adapter.status({ runId });
-        this.statuses.set(runId, st);
+        const result = await this.adapter.result({ runId });
+        this.results.set(runId, result);
       } catch {
-        this.statuses.set(runId, "error");
+        this.results.set(runId, "error");
       }
     }));
     this.onInvalidate();
@@ -52,11 +52,11 @@ export class RunDrilldown {
     if (this.disposed) return;
     if (data === KEY.moveDown || data === KEY.downArrow) {
       this.selectedPhase = Math.min(this.selectedPhase + 1, Math.max(0, this.run.irSnapshot.phases.length - 1));
-      this.statuses.clear();
+      this.results.clear();
       void this.refresh();
     } else if (data === KEY.moveUp || data === KEY.upArrow) {
       this.selectedPhase = Math.max(0, this.selectedPhase - 1);
-      this.statuses.clear();
+      this.results.clear();
       void this.refresh();
     } else if (data === KEY.escape || data === "\u0003") {
       this.dispose();
@@ -112,7 +112,7 @@ export class RunDrilldown {
 
     const phase = phases[this.selectedPhase];
     if (phase && phase.type === "gate") {
-      lines.push(`  condition: ${phase.condition.type}${phase.condition.type === "success" ? ` on "${phase.condition.outputKey}"` : " (unsupported at runtime)"} \u2192 skipToPhase ${phase.skipToPhase}`);
+      lines.push(`  condition: ${phase.condition.type}${phase.condition.type === "success" ? ` on "${phase.condition.outputKey}"` : ""} \u2192 skipToPhase ${phase.skipToPhase}`);
     } else if (phase) {
       if (phase.type === "loop") {
         const until = phase.until;
@@ -125,14 +125,14 @@ export class RunDrilldown {
           ? run.subagentRuns.find((r) => r.phaseIndex === this.selectedPhase && r.stepIndex === i)
           : run.subagentRunIds[i] ? { runId: run.subagentRunIds[i] } : undefined);
         if (record) {
-          const st = this.statuses.get(record.runId) ?? null;
-          if (st === "unavailable" || st === "error") lines.push(`     ${COPY.drilldown.dataUnavailable}`);
-          else if (st !== null) {
-            lines.push(COPY.drilldown.statusLine(st.state, st.totalTokens, st.totalCost));
-            if (st.steps && st.steps.length > 0) {
-              for (const s of st.steps.slice(0, 8)) {
-                lines.push(COPY.drilldown.stepLine(s.status, s.tokens));
-              }
+          const result = this.results.get(record.runId) ?? null;
+          if (result === "unavailable" || result === "error") lines.push(`     ${COPY.drilldown.dataUnavailable}`);
+          else if (result !== null) {
+            lines.push(COPY.drilldown.resultLine(result.state));
+            if (result.ready) {
+              const preview = outputPreview(result.outputAvailable ? result.output : "");
+              lines.push(`     ${COPY.drilldown.output(preview)}`);
+              if (result.outputTruncated) lines.push(`     ${COPY.drilldown.outputTruncated}`);
             }
           }
         }
@@ -142,4 +142,13 @@ export class RunDrilldown {
     lines.push(COPY.drilldown.footer);
     return lines;
   }
+}
+
+function outputPreview(output: string): string {
+  if (output.length === 0) return COPY.drilldown.noOutput;
+  // Strip ANSI escapes and C0 control chars to prevent TUI injection
+  const clean = output.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "").replace(/[\r\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, "");
+  const tail = clean.slice(-800);
+  const lines = tail.split("\n").slice(-6).join("\n");
+  return lines || COPY.drilldown.noOutput;
 }
